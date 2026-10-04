@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fastGatedFourierAnalysisNetwork"
+version = "1.0.0"
+description = "Gated Fourier Analysis Networks (gated FAN) on Keras 3 with the fastANN / fastLSTM workflow"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Federico Bari" }]
+requires-python = ">=3.9"
+dependencies = ["keras>=3", "numpy", "pandas", "scikit-learn", "joblib", "matplotlib", "plotly", "ipython"]
+
+[project.optional-dependencies]
+tensorflow = ["tensorflow>=2.16"]
+torch = ["torch"]
+jax = ["jax"]
+
+[project.urls]
+Homepage = "https://github.com/fede72bari/fastGatedFourierAnalysisNetwork"
+
+[tool.setuptools]
+packages = ["fastGatedFourierAnalysisNetwork"]
