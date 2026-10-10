@@ -4,6 +4,20 @@ All notable changes to `fastGatedFourierAnalysisNetwork` are documented here. Th
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [1.0.1] - 2026-10-10
+
+### Added
+- `distribution_strategy`: a TensorFlow distribution strategy (e.g. `tf.distribute.MirroredStrategy()` for the two T4
+  GPUs of Kaggle). The network is built, compiled and loaded inside its scope, so `fit` trains on all its devices.
+- `batch_multiple`, `effective_batch_multiple()`, `predict_array()` and module function `pad_rows_for_devices()`: with a
+  Keras distribution (JAX `keras.distribution.DataParallel`, e.g. the 8 cores of a TPU v5e-8) the arrays are completed to
+  a multiple of the number of devices with weight-0 rows, so every batch splits evenly.
+- README: section "Training on several devices (two GPUs, TPU)".
+
+### Fixed
+- Multi-device training on TPU stopped with `IndivisibleError` when the number of rows was not a multiple of the number
+  of devices.
+
 ## [1.0.0] - 2026-10-04
 
 First release.

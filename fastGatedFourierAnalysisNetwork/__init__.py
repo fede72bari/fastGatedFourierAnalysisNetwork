@@ -37,7 +37,7 @@ Typical workflow
 >>> fan.periodic_components_report()
 """
 
-__version__ = '1.0.0'
+__version__ = '1.0.1'
 
 # ---------------------------------------------------------------------------
 #                              Libraries Import
@@ -47,6 +47,7 @@ __version__ = '1.0.0'
 import sys
 import joblib
 import json
+import functools
 import os
 
 # Warnings
@@ -486,6 +487,67 @@ def make_auc_callback(keras, predict, y_true, rows_mask = None, name = 'val_moni
     return MonitoredAUC()
 
 
+def in_strategy_scope(method):
+    """
+    Run a method that creates Keras variables (model building, compiling,
+    loading) inside the scope of the TensorFlow distribution strategy given
+    as ``distribution_strategy`` (e.g. ``tf.distribute.MirroredStrategy()``
+    for several GPUs). Without a strategy the method runs unchanged.
+    """
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        strategy = getattr(self, 'distribution_strategy', None)
+        if(strategy is None):
+            return method(self, *args, **kwargs)
+        with strategy.scope():
+            return method(self, *args, **kwargs)
+    return wrapper
+
+
+def pad_rows_for_devices(X, Y = None, weights = None, multiple = 1):
+    """
+    Complete arrays of samples to a multiple of the number of devices of a data-parallel run.
+
+    Data-parallel training on ``multiple`` devices (e.g. the 8 cores of a TPU
+    v5e-8 with ``keras.distribution.DataParallel``) splits every batch evenly,
+    so the last partial batch must be divisible too. With a batch size that is
+    a multiple of ``multiple`` it is enough that the number of samples is a
+    multiple of it: the last row is repeated (at most ``multiple - 1`` times)
+    with sample weight 0, so loss and metrics do not change.
+
+    Parameters
+    ----------
+    X : array-like
+        Inputs, one row per sample.
+    Y : array-like, optional
+        Targets aligned with ``X``.
+    weights : array-like, optional
+        Sample weights (ones when ``None``).
+    multiple : int, default 1
+        Number of devices (1 = arrays returned unchanged).
+
+    Returns
+    -------
+    X, Y, weights : numpy.ndarray
+        Completed arrays (``weights`` is ``None`` when ``multiple`` is 1 and
+        no weights were given).
+    """
+    multiple = max(int(multiple), 1)
+    if(multiple == 1):
+        return X, Y, weights
+    X = np.asarray(X)
+    pad = (-len(X)) % multiple
+    w = np.ones(len(X), dtype = np.float32) if weights is None else np.asarray(weights, dtype = np.float32)
+    if(pad == 0):
+        return X, (None if Y is None else np.asarray(Y)), w
+    X = np.concatenate([X, np.repeat(X[-1:], pad, axis = 0)])
+    if(Y is not None):
+        Y = np.asarray(Y)
+        Y = np.concatenate([Y, np.repeat(Y[-1:], pad, axis = 0)])
+    w = np.concatenate([w, np.zeros(pad, dtype = np.float32)])
+    return X, Y, w
+
+
 class fastGatedFourierAnalysisNetwork:
     """
     Gated Fourier Analysis Network (gated FAN) for tabular and time-series
@@ -660,6 +722,21 @@ class fastGatedFourierAnalysisNetwork:
         ``X_test_s``): the AUC is computed only on the selected test rows
         (e.g. strike within 2% of the underlying). Implies ``monitor_auc =
         True``. Not stored in the saved files (only whether it was used).
+    batch_multiple : int, optional
+        Number of devices of a data-parallel run: training, validation and
+        prediction arrays are completed to a multiple of it (repeated last
+        row, weight 0) so that every batch splits evenly among the devices.
+        ``None`` (default) uses the number of devices of the active Keras
+        distribution (e.g. 8 with ``keras.distribution.DataParallel`` on a TPU
+        v5e-8) and 1 without distribution. The batch size must be a multiple
+        of it.
+    distribution_strategy : tf.distribute.Strategy, optional
+        TensorFlow backend only: the model is built, compiled and loaded
+        inside ``distribution_strategy.scope()``, so that ``fit`` trains it on
+        all the devices of the strategy, e.g.
+        ``tf.distribute.MirroredStrategy()`` for the two T4 GPUs of Kaggle
+        (every batch is split among the GPUs). ``None`` (default) uses one
+        device. With JAX use ``keras.distribution.DataParallel`` instead.
     shuffle : bool, default True
         Permute the training rows among the batches at every epoch (Keras
         ``fit(shuffle = ...)``). It changes only the order in which the rows
@@ -761,6 +838,8 @@ class fastGatedFourierAnalysisNetwork:
                  sample_weight = None,
                  monitor_auc = False,
                  monitor_auc_rows = None,
+                 batch_multiple = None,
+                 distribution_strategy = None,
                  backend = None):
 
         # Keras with the requested backend (fixed for the whole Python process by the first instance)
@@ -858,6 +937,8 @@ class fastGatedFourierAnalysisNetwork:
         # with pre-split inputs the arrays already refer to the training / test rows
         self.sample_weight_train = self.sample_weight
         self.monitor_auc_rows_test = self.monitor_auc_rows
+        self.batch_multiple = batch_multiple
+        self.distribution_strategy = distribution_strategy
 
         self.scaler = StandardScaler()
 
@@ -1160,6 +1241,7 @@ class fastGatedFourierAnalysisNetwork:
         return self.model_checkpoint
 
 
+    @in_strategy_scope
     def network_structure_set_compile(self):
         """
         Build and compile the network.
@@ -1295,6 +1377,55 @@ class fastGatedFourierAnalysisNetwork:
         return periods
 
 
+    def effective_batch_multiple(self):
+        """
+        Number of devices the batches must be divisible by (see ``batch_multiple``).
+
+        Returns
+        -------
+        int
+            ``batch_multiple`` when set; otherwise the number of devices of
+            the active Keras distribution (``keras.distribution``), or 1.
+        """
+        if(getattr(self, 'batch_multiple', None)):
+            return int(self.batch_multiple)
+        try:
+            distribution = self.keras.distribution.distribution()
+        except Exception:
+            distribution = None
+        mesh = getattr(distribution, 'device_mesh', None)
+        if(mesh is None):
+            return 1
+        return max(int(np.size(mesh.devices)), 1)
+
+
+    def predict_array(self, X, batch_size = None, verbose = 0):
+        """
+        ``model.predict`` that also works with data-parallel distribution on several devices.
+
+        The inputs are completed to a multiple of :meth:`effective_batch_multiple`
+        and the predictions of the added rows are dropped.
+
+        Parameters
+        ----------
+        X : array-like
+            Inputs, already scaled.
+        batch_size : int, optional
+            Prediction batch size (Keras default 32); must be a multiple of
+            the number of devices.
+        verbose : int, default 0
+            Keras verbosity.
+
+        Returns
+        -------
+        numpy.ndarray
+            One row of predictions per row of ``X``.
+        """
+        n = len(X)
+        X_pad, _, _ = pad_rows_for_devices(X, multiple = self.effective_batch_multiple())
+        return self.model.predict(X_pad, batch_size = batch_size, verbose = verbose)[:n]
+
+
     def auc_callbacks(self, X_val, Y_val):
         """
         The test-set AUC monitor (see ``monitor_auc``), as a list ready for ``fit``.
@@ -1313,7 +1444,7 @@ class fastGatedFourierAnalysisNetwork:
         if(not getattr(self, 'monitor_auc', False)):
             return []
 
-        return [make_auc_callback(self.keras, lambda: self.model.predict(X_val, verbose = 0), np.asarray(Y_val),
+        return [make_auc_callback(self.keras, lambda: self.predict_array(X_val), np.asarray(Y_val),
                                   getattr(self, 'monitor_auc_rows_test', None))]
 
 
@@ -1448,15 +1579,27 @@ class fastGatedFourierAnalysisNetwork:
             X_val = self.X_test_s
             Y_val = self.Y_test_s if self.scale_targets else self.Y_test
 
+        # data-parallel runs (several devices): every batch must split evenly, so the arrays are completed to a multiple
+        # of the number of devices with weight-0 rows (unchanged with a single device)
+        multiple = self.effective_batch_multiple()
+        if(batch_size % multiple != 0):
+            raise ValueError(f'batch_size {batch_size} must be a multiple of {multiple} (devices of the data-parallel distribution).')
+        X_fit, Y_fit, W_fit = pad_rows_for_devices(X_train, Y_train, getattr(self, 'sample_weight_train', None), multiple)
+        if(multiple > 1):
+            X_val_fit, Y_val_fit, W_val_fit = pad_rows_for_devices(X_val, Y_val, None, multiple)
+            validation_data = (X_val_fit, Y_val_fit, W_val_fit)
+        else:
+            validation_data = (X_val, Y_val)
+
         # model training
         history = self.model.fit(
-            x=X_train,
-            y=Y_train,
-            validation_data=(X_val, Y_val),
+            x=X_fit,
+            y=Y_fit,
+            validation_data=validation_data,
             epochs=epochs,
             batch_size=batch_size,
             shuffle=self.shuffle,
-            sample_weight=getattr(self, 'sample_weight_train', None),
+            sample_weight=W_fit,
             # the AUC monitor comes first: it writes val_monitored_auc into the logs read by early stopping and checkpoint
             callbacks=self.auc_callbacks(X_val, Y_val) + [self.early_stop, self.model_checkpoint] + list(callbacks or [])
         )
@@ -1524,6 +1667,7 @@ class fastGatedFourierAnalysisNetwork:
         print(f'Hyperparameters loaded.')
 
 
+    @in_strategy_scope
     def load_model(self, model_file_name = None, file_path_name = None):
         """
         Load a saved Keras model into ``self.model``.
@@ -1611,7 +1755,7 @@ class fastGatedFourierAnalysisNetwork:
             print('Scaler applied.')
             data = self.scaler.transform(data)
 
-        predictions = self.model.predict(data)
+        predictions = self.predict_array(data)
 
         if descale_result and self.scale_targets and (self.Y_scaler is not None):
             predictions = self.Y_scaler.inverse_transform(predictions)
@@ -1790,7 +1934,7 @@ class fastGatedFourierAnalysisNetwork:
         print(f'len Y_test {len(self.Y_test)}')
 
         # Cut off predictions with low probability
-        predictions = self.model.predict(self.X_test_s)
+        predictions = self.predict_array(self.X_test_s)
         predictions_df = pd.DataFrame(predictions)
         filtered_predictions_results_df = pd.DataFrame()
 

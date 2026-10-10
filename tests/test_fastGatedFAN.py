@@ -9,6 +9,10 @@ import numpy as np, pandas as pd
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from fastGatedFourierAnalysisNetwork import fastGatedFAN, fan_layers, periodic_split, time_index_feature, __version__
+import keras
+
+# fixed seed: without it the weight initialisation changes at every run and the accuracy threshold below can fail by chance
+keras.utils.set_random_seed(0)
 
 rng = np.random.default_rng(0)
 n = 3000

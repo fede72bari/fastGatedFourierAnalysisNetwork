@@ -13,7 +13,7 @@ fan.network_predictions_evaluation(min_probability = 0.5)
 fan.periodic_components_report()                          # how much periodic modelling the network kept
 ```
 
-**Current version: 1.0.0** (`fastGatedFourierAnalysisNetwork.__version__`) — see the [CHANGELOG](CHANGELOG.md).
+**Current version: 1.0.1** (`fastGatedFourierAnalysisNetwork.__version__`) — see the [CHANGELOG](CHANGELOG.md).
 
 ## Contents
 
@@ -25,10 +25,11 @@ fan.periodic_components_report()                          # how much periodic mo
 6. [Network architecture and parameters](#network-architecture-and-parameters)
 7. [Methods reference](#methods-reference)
 8. [Saved files and model versioning](#saved-files-and-model-versioning)
-9. [Examples](#examples)
-10. [Practical guide: choosing the settings](#practical-guide-choosing-the-settings)
-11. [Same API as fastANN and fastLSTM](#same-api-as-fastann-and-fastlstm)
-12. [References](#references)
+9. [Training on several devices (two GPUs, TPU)](#training-on-several-devices-two-gpus-tpu)
+10. [Examples](#examples)
+11. [Practical guide: choosing the settings](#practical-guide-choosing-the-settings)
+12. [Same API as fastANN and fastLSTM](#same-api-as-fastann-and-fastlstm)
+13. [References](#references)
 
 ---
 
@@ -173,6 +174,8 @@ All fastANN parameters are available with the same names and meaning (`X_data`, 
 | `sample_weight` | `None` | One weight per row of `X_data`: the training rows weight the loss (e.g. larger weights for the hard cases). Not saved in the files (only whether it was used). |
 | `monitor_auc` | `False` | ROC AUC of the test-set predictions computed at the end of every epoch and logged as `val_monitored_auc`: use it as `early_stop_monitor_metric` / `checkpoint_monitor_metric` with mode `'max'` to choose the epoch on the AUC. |
 | `monitor_auc_rows` | `None` | One flag per row of `X_data`: the monitored AUC uses only the selected test rows (e.g. the hard cases). Implies `monitor_auc = True`. |
+| `distribution_strategy` | `None` | TensorFlow only: the network is built, compiled and loaded inside its scope, so that `fit` trains on all its devices, e.g. `tf.distribute.MirroredStrategy()` for two GPUs (see [Training on several devices](#training-on-several-devices-two-gpus-tpu)). |
+| `batch_multiple` | `None` | Arrays are completed to a multiple of it (last row repeated with weight 0) so that every batch splits evenly among the devices. `None` uses the number of devices of the active Keras distribution (8 with `keras.distribution.DataParallel` on a TPU v5e-8) and 1 without distribution. |
 | `model_name` | `'GatedFAN'` | Name used in the saved files. |
 
 ## Methods reference
@@ -183,9 +186,9 @@ Same methods as fastANN, with the same signatures:
 |---|---|
 | Build and train | `network_structure_set_compile()`, `network_training(epochs, batch_size, callbacks = None)`, `early_stop_patience_set(patience)`, `checkpoint_callback(save_best_only)` |
 | Evaluate | `network_predictions_evaluation(min_probability, output_dict = False)`, `binary_precision_recall_vs_scoring(n_points, plot)`, `plot_training_history()`, `gradient_feature_importance(feature_names)` |
-| Predict | `model_predict(data, apply_scaler = True, descale_result = True)` |
+| Predict | `model_predict(data, apply_scaler = True, descale_result = True)`, `predict_array(X)` (`model.predict` on scaled inputs that also works with several devices) |
 | Save and load | `load_all(hyperparameters_file_name, file_path_name)`, `load_model()`, `load_scaler()`, `load_training_history()`, `load_hyperparameters()`, `save_hyperparameters()` |
-| Data | `split_and_scale(scaler_fit)` |
+| Data | `split_and_scale(scaler_fit)`, `effective_batch_multiple()` |
 | **Gated FAN** | `periodic_components_report(plot = True)`: per layer, number of frequencies, mean/min/max gate, quartiles of the learned periods; optional chart of gate vs period of every frequency of the first layer. `initialize_log_periods(init_periods)`: deterministic first-layer frequencies (called automatically with `frequency_init = 'log_periods'`) |
 
 Module functions: `fan_layers()` (the custom Keras objects `GatedFAN` and `FrequencyClip`, for use in your own Keras models or as `custom_objects`), `periodic_split(units, periodic_share)`, `time_index_feature(timestamps, unit, origin)`, `load_keras(backend)`.
@@ -204,6 +207,45 @@ Module functions: `fan_layers()` (the custom Keras objects `GatedFAN` and `Frequ
 | `<dt> - X_data / Y_data FOR GATED FAN MODEL - <name>.csv` | The dataset (with `save_X_Y_data`, default), so the same split can be rebuilt. |
 
 The JSON is the entry point of the run: `fastGatedFAN().load_all(json_name, file_path_name = folder)` restores model, scalers, history and data. The best model is on disk from the first improving epoch, so an interrupted session (time limit, lost GPU) still leaves a usable checkpoint. A model trained with one backend reloads with the other. The versioning practices of the [fastANN README](https://github.com/fede72bari/fastANN#model-versioning-runs-datasets-and-hyperparameters) apply unchanged (replace `ANN MODEL` with `GATED FAN MODEL` in the file patterns).
+
+## Training on several devices (two GPUs, TPU)
+
+Data parallelism: every batch is split among the devices, each one computes the gradients of its share and the weights are updated with their average. Network, results and saved files are the same as on one device; only the time per epoch changes.
+
+### Two or more GPUs (TensorFlow, e.g. Kaggle "GPU T4 x2")
+
+```python
+import tensorflow as tf
+
+fan = fastGatedFAN(X_data = X_df, Y_data = Y_df, distribution_strategy = tf.distribute.MirroredStrategy(),
+                   data_storage_path = './models/')
+fan.network_structure_set_compile()                  # built and compiled inside strategy.scope()
+fan.network_training(epochs = 100, batch_size = 4096) # each GPU gets 2048 rows per step
+```
+
+- The network is built, compiled and reloaded inside `strategy.scope()`. Entering the scope by hand (`strategy.scope().__enter__()`) is **not** enough with Keras 3: the variables are not distributed and `fit` fails with ``colocate_vars_with must only be passed a variable created in this tf.distribute.Strategy.scope()``.
+- `batch_size` is the global batch, split among the GPUs. The same batch gives the same training as on one GPU; a larger one uses the GPUs better but changes the optimisation (fewer updates per epoch).
+- Without `distribution_strategy` TensorFlow trains on **one** GPU even when two are visible.
+
+### TPU (JAX, e.g. Kaggle TPU v5e-8, Google Colab TPU)
+
+```python
+import os
+os.environ['KERAS_BACKEND'] = 'jax'
+import jax, keras
+
+keras.distribution.set_distribution(keras.distribution.DataParallel(devices = jax.devices()))   # 8 cores on a v5e-8
+fan = fastGatedFAN(X_data = X_df, Y_data = Y_df, backend = 'jax', data_storage_path = './models/')
+fan.network_structure_set_compile()
+fan.network_training(epochs = 100, batch_size = 4096)
+```
+
+- With a Keras distribution every batch must split evenly among the devices, otherwise JAX stops with `IndivisibleError` (typically on the last, partial batch of the epoch). Training, validation and prediction arrays are completed to a multiple of the number of devices (`batch_multiple`, read from the active distribution: 8 on a v5e-8, 1 without distribution) by repeating the last row **with sample weight 0**, so loss and metrics do not change; the batch size must be a multiple of it.
+- `predict_array(X)` is `model.predict` for this case (pads, predicts, drops the added rows); `model_predict`, the AUC monitor and `network_predictions_evaluation` use it.
+- A TPU can be opened by one process only: if the notebook calls `jax.devices()` and then trains in a subprocess, the subprocess finds the TPU busy.
+- Colab TPU runtimes have no TensorFlow: use `backend = 'jax'` (models trained there reload with TensorFlow or PyTorch).
+
+The FAN layer itself has no device-specific code: on GPU it is a few matrix products, on TPU XLA fuses it with the rest of the network.
 
 ## Examples
 
@@ -280,6 +322,8 @@ model = keras.Sequential([keras.Input((n_features,)), GatedFAN(256), keras.layer
 ## Same API as fastANN and fastLSTM
 
 `fastGatedFourierAnalysisNetwork` is a drop-in sibling of [`fastANN`](https://github.com/fede72bari/fastANN) (dense networks) and [`fastLSTM`](https://github.com/fede72bari/fastLSTM) (recurrent networks): same constructor parameters, methods, scaling and splitting rules, callbacks, saved-file layout and loading logic. A comparison between the three families is the same script with a different class name. `fastGatedFAN` is a short alias of the class.
+
+The `GatedFAN` layer is shared: [fastANN](https://github.com/fede72bari/fastANN) uses it as hidden layer (`hidden_layer_type = 'gated_fan'`) and [fastLSTM](https://github.com/fede72bari/fastLSTM) as a projection of every bar before the LSTMs (`input_projection = 'gated_fan'`, the hybrid gated FAN + LSTM). Models saved by one package load in the others.
 
 ## References
 

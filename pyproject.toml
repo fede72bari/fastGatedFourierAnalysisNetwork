@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fastGatedFourierAnalysisNetwork"
-version = "1.0.0"
+version = "1.0.1"
 description = "Gated Fourier Analysis Networks (gated FAN) on Keras 3 with the fastANN / fastLSTM workflow"
 readme = "README.md"
 license = { text = "MIT" }
